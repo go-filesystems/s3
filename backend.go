@@ -288,10 +288,18 @@ var (
 //	fsys.Stat("/nope.txt")  ->  fat32: "/nope.txt" not found
 //	errors.Is(err, fs.ErrNotExist)  ->  FALSE
 //
-// That is not a quirk of this package's expectations. go-filesystems/webdav
-// classifies with exactly the same errors.Is(err, fs.ErrNotExist) -- so it
-// answers 500 where it means 404, today, for every missing file on fat32. The
-// same shape is in /nfs and /sftp.
+// ⚠ AN EARLIER VERSION OF THIS COMMENT SAID WEBDAV ANSWERS 500 FOR THE SAME
+// REASON. IT DOES NOT. Measured afterwards: GET of a missing file over
+// go-filesystems/webdav answers 404, with the old fat32 and the new one alike.
+// It tries errors.Is first and then falls back to a table of twelve message
+// fragments -- "not found" among them. The claim came from reading the
+// errors.Is switch and stopping before the fallback underneath it.
+//
+// What is true is worse in a quieter way, and webdav's own comment on that
+// table says it: the table is "a *last* resort", the same twelve entries are
+// duplicated in go-filesystems/nfs, and correctness depends on how each driver
+// PHRASES its errors. This package had no such table, which is why a missing
+// key surfaced here as InternalError rather than passing unnoticed.
 //
 // The real fix belongs in the drivers: "not found" should satisfy
 // errors.Is(err, fs.ErrNotExist), and the interface package should say so.
