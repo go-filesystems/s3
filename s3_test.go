@@ -7,7 +7,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -313,8 +316,11 @@ func TestUnknownAccessKey_IsRefused(t *testing.T) {
 	w := do(t, srv, r)
 	var e errorResponse
 	_ = xml.Unmarshal(w.Body.Bytes(), &e)
-	if e.Code != "InvalidAccessKeyId" {
-		t.Errorf("code = %q, want InvalidAccessKeyId", e.Code)
+	// ⛔ Not InvalidAccessKeyId, as AWS answers: that code tells anybody which
+	// access keys -- which user names -- exist. An unknown key is a wrong
+	// signature.
+	if w.Code != http.StatusForbidden || e.Code != "SignatureDoesNotMatch" {
+		t.Errorf("an unknown key got %d %q, want 403 SignatureDoesNotMatch", w.Code, e.Code)
 	}
 }
 
@@ -374,3 +380,110 @@ func TestListingCarriesTheXMLNamespace(t *testing.T) {
 }
 
 var _ = io.Discard
+
+// ⛔ Whether an access key exists must not be readable from the answer, on any
+// path: before, an unknown key was refused before the date was looked at, so a
+// malformed or stale date told the two apart (400 or "expired" for a known
+// key, InvalidAccessKeyId for an unknown one) -- found by a security audit.
+func TestAnUnknownKeyIsAnsweredAsAWrongSecret(t *testing.T) {
+	srv := testServer(t)
+	type answer struct {
+		status int
+		code   string
+	}
+	ask := func(keyID string, date string) answer {
+		r := httptest.NewRequest(http.MethodGet, "http://s3.example.org/", nil)
+		r.Host = "s3.example.org"
+		payload := sigv4.HashSHA256(nil)
+		r.Header.Set("x-amz-content-sha256", payload)
+		sigv4.New("eu-west-1", "s3", sigv4.Credentials{
+			AccessKeyID: keyID, SecretAccessKey: "not-the-secret",
+		}).SignRaw(r, payload, srv.now())
+		if date != "" {
+			r.Header.Set("x-amz-date", date)
+		}
+		w := do(t, srv, r)
+		var e errorResponse
+		_ = xml.Unmarshal(w.Body.Bytes(), &e)
+		return answer{w.Code, e.Code}
+	}
+	for _, date := range []string{"", "not a date", srv.now().Add(-2 * time.Hour).UTC().Format("20060102T150405Z")} {
+		known, unknown := ask(testKeyID, date), ask("AKIANOBODY", date)
+		if known != unknown {
+			t.Errorf("date %q: a known key got %v, an unknown one %v", date, known, unknown)
+		}
+	}
+	// Presigned URLs, the same.
+	for _, mutate := range []func(url.Values){
+		func(url.Values) {},
+		func(q url.Values) { q.Set("X-Amz-Date", "not a date") },
+		func(q url.Values) { q.Set("X-Amz-Expires", "0") },
+	} {
+		k := presigned(t, srv, testKeyID, "not-the-secret", srv.now(), 60, mutate)
+		u := presigned(t, srv, "AKIANOBODY", "not-the-secret", srv.now(), 60, mutate)
+		wk, wu := do(t, srv, k), do(t, srv, u)
+		var ek, eu errorResponse
+		_ = xml.Unmarshal(wk.Body.Bytes(), &ek)
+		_ = xml.Unmarshal(wu.Body.Bytes(), &eu)
+		// Everything but the request id, which differs for every answer.
+		if wk.Code != wu.Code || ek.Code != eu.Code || ek.Message != eu.Message {
+			t.Errorf("presigned: a known key got %d %s, an unknown one %d %s", wk.Code, wk.Body.String(), wu.Code, wu.Body.String())
+		}
+	}
+}
+
+// ⛔ A presigned URL lasts a week at most, as AWS bounds X-Amz-Expires, and is
+// not valid before its date. Before, a key holder could mint a link that never
+// expired, by a huge X-Amz-Expires or a date in the future.
+func TestAPresignedURLIsBoundedInTime(t *testing.T) {
+	srv := testServer(t)
+	if w := do(t, srv, presigned(t, srv, testKeyID, testSecret, srv.now(), 60, nil)); w.Code != http.StatusOK {
+		t.Fatalf("a valid presigned URL got %d: %s", w.Code, w.Body.String())
+	}
+	if w := do(t, srv, presigned(t, srv, testKeyID, testSecret, srv.now(), 7*24*3600+1, nil)); w.Code == http.StatusOK {
+		t.Error("a presigned URL lasting more than a week was accepted")
+	}
+	if w := do(t, srv, presigned(t, srv, testKeyID, testSecret, srv.now().Add(24*time.Hour), 60, nil)); w.Code == http.StatusOK {
+		t.Error("a presigned URL dated tomorrow was accepted")
+	}
+}
+
+// presigned builds a presigned GET of the bucket list, signed as the server
+// checks it; mutate, if given, changes the query before signing.
+func presigned(t *testing.T, srv *Server, keyID, secret string, at time.Time, expires int, mutate func(url.Values)) *http.Request {
+	t.Helper()
+	at = at.UTC()
+	q := url.Values{}
+	q.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+	q.Set("X-Amz-Credential", keyID+"/"+at.Format("20060102")+"/eu-west-1/s3/aws4_request")
+	q.Set("X-Amz-Date", at.Format("20060102T150405Z"))
+	q.Set("X-Amz-Expires", strconv.Itoa(expires))
+	q.Set("X-Amz-SignedHeaders", "host")
+	if mutate != nil {
+		mutate(q)
+	}
+	r := httptest.NewRequest(http.MethodGet, "http://s3.example.org/?"+q.Encode(), nil)
+	r.Host = "s3.example.org"
+	probe := r.Clone(r.Context())
+	probe.Header = make(http.Header)
+	sig := sigv4.New("eu-west-1", "s3", sigv4.Credentials{AccessKeyID: keyID, SecretAccessKey: secret}).SignRaw(probe, "UNSIGNED-PAYLOAD", at)
+	q.Set("X-Amz-Signature", sig.Signature)
+	r = httptest.NewRequest(http.MethodGet, "http://s3.example.org/?"+q.Encode(), nil)
+	r.Host = "s3.example.org"
+	return r
+}
+
+// Every error carries a request id a client can quote; it used to read
+// "%!x(<nil>)".
+func TestAnErrorCarriesARequestID(t *testing.T) {
+	srv := testServer(t)
+	r := httptest.NewRequest(http.MethodGet, "http://s3.example.org/", nil)
+	w := do(t, srv, r)
+	var e errorResponse
+	if err := xml.Unmarshal(w.Body.Bytes(), &e); err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile(`^[0-9a-f]{16}$`).MatchString(e.RequestID) {
+		t.Errorf("RequestId = %q", e.RequestID)
+	}
+}
