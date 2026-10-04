@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	filesystem "github.com/go-filesystems/interface"
@@ -21,6 +22,9 @@ import (
 // than owning a listener.
 type Server struct {
 	store store
+
+	decoyOnce sync.Once
+	decoy     string
 
 	// Credentials resolves an access key to its secret. Required: a server
 	// with no way to check a signature would have to accept every request,

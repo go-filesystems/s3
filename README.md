@@ -34,6 +34,15 @@ believe. A **file** at the root is not a bucket and is not reachable at all.
 continuation), `HeadObject`, `GetObject` with `Range`. Authenticated with AWS
 Signature Version 4, header or presigned.
 
+- **An unknown access key is answered as a wrong signature**
+  (`SignatureDoesNotMatch`), through the same checks in the same order, an
+  HMAC with a decoy secret included: AWS's `InvalidAccessKeyId` would tell
+  anybody which access keys (which user names) exist. Since v0.3.0.
+- **A presigned URL lasts a week at most** (`X-Amz-Expires` ≤ 604800, AWS's
+  bound) and is refused before its own `X-Amz-Date`. Before v0.3.0 presigned
+  URLs were refused whatever their signature: the signature was deleted from
+  the query before it was compared.
+
 **Exports are read-only by default**, following the rest of the family. Most of
 what this is pointed at is a forensic or build artefact, and an accidental
 write to one is unrecoverable.

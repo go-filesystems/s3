@@ -3,6 +3,7 @@
 package s3
 
 import (
+	"crypto/rand"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -39,7 +40,6 @@ var (
 	errSignatureFailed = apiError{"SignatureDoesNotMatch", http.StatusForbidden,
 		"the request signature does not match the signature this server computed"}
 	errMissingSignature = apiError{"AccessDenied", http.StatusForbidden, "the request was not signed"}
-	errUnknownKeyID     = apiError{"InvalidAccessKeyId", http.StatusForbidden, "there is no access key of that name here"}
 	errExpired          = apiError{"AccessDenied", http.StatusForbidden, "the request signature has expired"}
 	errReadOnly         = apiError{"AccessDenied", http.StatusForbidden, "this export is read-only"}
 )
@@ -90,10 +90,14 @@ func requestID(r *http.Request) string {
 	if id := r.Header.Get("x-amz-request-id"); id != "" {
 		return id
 	}
-	return fmt.Sprintf("%016x", r.Context().Value(requestIDKey{}))
+	// ⛔ It read a context value nothing ever set, so every error said
+	// "%!x(<nil>)". One random id per answer is what a client quotes back.
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%016x", b)
 }
-
-type requestIDKey struct{}
 
 // errNilFilesystem and errNoCredentials are construction failures, not
 // request failures: a Server built without either cannot serve anything

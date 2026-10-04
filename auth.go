@@ -4,6 +4,8 @@ package s3
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
+	"encoding/hex"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -62,10 +64,7 @@ func (s *Server) authorizeHeader(r *http.Request) (string, apiError) {
 	if !ok {
 		return "", errInvalidRequest
 	}
-	secret, ok := s.Credentials(scope.accessKeyID)
-	if !ok {
-		return "", errUnknownKeyID
-	}
+	secret, known := s.secretFor(scope.accessKeyID)
 	t, err := amzTime(r.Header.Get("x-amz-date"), r.Header.Get("Date"))
 	if err != nil {
 		return "", errInvalidRequest
@@ -99,7 +98,7 @@ func (s *Server) authorizeHeader(r *http.Request) (string, apiError) {
 		AccessKeyID: scope.accessKeyID, SecretAccessKey: secret,
 	})
 	got := signer.SignRaw(probe, payload, t)
-	if !hmac.Equal([]byte(got.Signature), []byte(claimed)) {
+	if !hmac.Equal([]byte(got.Signature), []byte(claimed)) || !known {
 		return "", errSignatureFailed
 	}
 	return scope.accessKeyID, apiError{}
@@ -112,10 +111,7 @@ func (s *Server) authorizePresigned(r *http.Request, q url.Values) (string, apiE
 	if !ok {
 		return "", errInvalidRequest
 	}
-	secret, ok := s.Credentials(scope.accessKeyID)
-	if !ok {
-		return "", errUnknownKeyID
-	}
+	secret, known := s.secretFor(scope.accessKeyID)
 	t, err := time.Parse("20060102T150405Z", q.Get("X-Amz-Date"))
 	if err != nil {
 		return "", errInvalidRequest
@@ -123,25 +119,37 @@ func (s *Server) authorizePresigned(r *http.Request, q url.Values) (string, apiE
 	// ⛔ A presigned URL expires by its OWN X-Amz-Expires, not by the server's
 	// clock-skew window. Applying the skew window instead would reject a link
 	// meant to last a week, ten minutes after it was made.
+	//
+	// ⛔ But bounded: a week at most, as AWS bounds it, and not dated in the
+	// future beyond the clock skew. Either way a key holder could otherwise
+	// mint a link that never expires (security audit).
 	expires, err := strconv.Atoi(q.Get("X-Amz-Expires"))
-	if err != nil || expires <= 0 {
+	if err != nil || expires <= 0 || expires > maxPresignedSeconds {
 		return "", errInvalidRequest
+	}
+	if t.After(s.now().Add(s.skew())) {
+		return "", errExpired
 	}
 	if s.now().After(t.Add(time.Duration(expires) * time.Second)) {
 		return "", errExpired
 	}
 
+	// ⛔ Read before it is deleted: url.Values is a map, so a "copy" made by
+	// assignment is the same map, and deleting the signature from it deleted
+	// it from q too. Every presigned URL was then compared with "" and
+	// refused, whatever its signature (found by this package's first test of
+	// a valid presigned URL).
+	claimed := q.Get("X-Amz-Signature")
 	probe := r.Clone(r.Context())
 	probe.Header = make(http.Header)
-	rq := q
-	rq.Del("X-Amz-Signature")
-	probe.URL.RawQuery = rq.Encode()
+	q.Del("X-Amz-Signature")
+	probe.URL.RawQuery = q.Encode()
 
 	signer := sigv4.New(scope.region, scope.service, sigv4.Credentials{
 		AccessKeyID: scope.accessKeyID, SecretAccessKey: secret,
 	})
 	got := signer.SignRaw(probe, "UNSIGNED-PAYLOAD", t)
-	if !hmac.Equal([]byte(got.Signature), []byte(q.Get("X-Amz-Signature"))) {
+	if !hmac.Equal([]byte(got.Signature), []byte(claimed)) || !known {
 		return "", errSignatureFailed
 	}
 	return scope.accessKeyID, apiError{}
@@ -201,4 +209,31 @@ func (s *Server) skewed(t time.Time) bool {
 		d = -d
 	}
 	return d > s.skew()
+}
+
+// maxPresignedSeconds is the longest a presigned URL may last: a week, the
+// bound AWS applies to X-Amz-Expires.
+const maxPresignedSeconds = 7 * 24 * 60 * 60
+
+// secretFor is the secret to check a signature with, and whether the key
+// exists.
+//
+// ⛔ An unknown key is answered exactly as a known key with a wrong
+// signature: it goes through the same checks, in the same order, and an HMAC
+// is computed with a decoy secret drawn once per server. Answering
+// InvalidAccessKeyId (as AWS does), or refusing before the date checks, or
+// skipping the HMAC, each told an unauthenticated caller which access keys
+// -- which user names -- exist (security audit).
+func (s *Server) secretFor(id string) (string, bool) {
+	if secret, ok := s.Credentials(id); ok {
+		return secret, true
+	}
+	s.decoyOnce.Do(func() {
+		var b [32]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			panic("s3: no randomness for the decoy secret: " + err.Error())
+		}
+		s.decoy = hex.EncodeToString(b[:])
+	})
+	return s.decoy, false
 }
