@@ -3,9 +3,8 @@
 package s3
 
 import (
-	"crypto/md5"
-	"encoding/hex"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -39,13 +38,9 @@ type object struct {
 // store is the Filesystem seen as an object store.
 type store struct {
 	fsys filesystem.Filesystem
-	// maxObject bounds what GET will read. The driver interface offers
-	// ReadFile and nothing else -- no opener, no reader -- so serving an
-	// object means holding all of it in memory. That is fine for the
-	// artefacts this is pointed at and ruinous for a 40 GB disk image, so it
-	// is a stated limit that answers EntityTooLarge rather than an allocation
-	// that takes the process down.
-	maxObject int64
+	// etags remembers what each object's ETag was, and for which size and
+	// modification time: see objects.go.
+	etags *etagCache
 }
 
 func (s store) buckets() ([]bucket, error) {
@@ -77,7 +72,7 @@ func (s store) hasBucket(name string) bool {
 }
 
 // head is HEAD of one object.
-func (s store) head(bkt, key string) (object, error) {
+func (s store) head(bkt, key string, max int64) (object, error) {
 	p := objectPath(bkt, key)
 	st, err := s.fsys.Stat(p)
 	if err != nil {
@@ -92,33 +87,29 @@ func (s store) head(bkt, key string) (object, error) {
 	// ⛔ The ETag is read from the CONTENT, not invented from the metadata.
 	// It is the MD5 of a single-part object, and rclone and the AWS SDKs
 	// compare it against what they received: an ETag that does not match the
-	// bytes turns every download into a reported corruption.
-	if o.size <= s.maxObject {
-		if data, err := s.fsys.ReadFile(p); err == nil {
-			o.etag = etagOf(data)
-		}
+	// bytes turns every download into a reported corruption. It is computed
+	// once per version of the object, streamed: see objects.go.
+	if etag, ok := s.etagFor(p, o.size, o.modTime, max); ok {
+		o.etag = etag
 	}
 	return o, nil
 }
 
-// get returns the whole object. Range is applied by the caller, because a
-// Range that cannot be satisfied is a different S3 error from a missing key.
-func (s store) get(bkt, key string) ([]byte, object, error) {
-	o, err := s.head(bkt, key)
+// get returns the object's bytes as an io.ReaderAt, without reading them:
+// from the driver's opened file when it has Opener, or, for a driver without
+// one, from memory, which only an object of at most max bytes is allowed.
+// Range is applied by the caller, because a Range that cannot be satisfied is
+// a different S3 error from a missing key.
+func (s store) get(bkt, key string, max int64) (io.ReaderAt, func(), object, error) {
+	o, err := s.head(bkt, key, max)
 	if err != nil {
-		return nil, object{}, err
+		return nil, nil, object{}, err
 	}
-	if o.size > s.maxObject {
-		return nil, object{}, errTooLargeErr
-	}
-	data, err := s.fsys.ReadFile(objectPath(bkt, key))
+	r, done, err := s.open(objectPath(bkt, key), max)
 	if err != nil {
-		return nil, object{}, err
+		return nil, nil, object{}, err
 	}
-	if o.etag == "" {
-		o.etag = etagOf(data)
-	}
-	return data, o, nil
+	return r, done, o, nil
 }
 
 // list walks a bucket, honouring prefix and delimiter the way S3 does.
@@ -267,11 +258,6 @@ func validBucket(name string) bool {
 		return false
 	}
 	return !strings.ContainsAny(name, "/\\\x00")
-}
-
-func etagOf(b []byte) string {
-	sum := md5.Sum(b)
-	return `"` + hex.EncodeToString(sum[:]) + `"`
 }
 
 // Sentinels the handlers translate into apiErrors.

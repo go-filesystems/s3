@@ -56,10 +56,21 @@ a policy nobody enforces is worse than answering *no*. A client that asks gets
 
 ## Two things worth knowing before you point it at something large
 
-**`GetObject` reads the whole object into memory.** The driver interface offers
-`ReadFile` and nothing else — no opener, no reader — so there is no streaming
-read to use. `MaxObjectBytes` (256 MiB by default) bounds it and answers
-`EntityTooLarge` rather than taking the process down.
+**`GetObject` streams the object** (since v0.5.0) when the driver opens files
+(`filesystem.Opener`), whatever its size; a file of the host
+([`osfs`](https://github.com/go-filesystems/osfs)) goes out with `sendfile(2)`
+over plain HTTP. Before, every GET and HEAD read the whole object into memory
+— a few concurrent requests for large objects cost the server gigabytes, and
+nothing over 256 MiB could be served. A driver without `Opener` can only hand
+over a whole file, so for it `MaxObjectBytes` (256 MiB by default) still bounds
+what is read into memory and answers `EntityTooLarge` past it.
+
+**The ETag is the MD5 of the content**, which rclone and the AWS SDKs check: it
+is computed once per version of an object — streamed through the hash, and
+kept while its size and modification time are unchanged (4096 objects
+remembered). Past `MaxObjectBytes` the ETag is multipart-shaped (`"…-1"`),
+which S3 says is not an MD5 and clients do not compare with one: a HEAD of a
+40 GB object does not read 40 GB.
 
 **`LastModified` is the epoch.** `filesystem.Stat` carries `Mode`, `Size` and
 `Inode`, and no modification time at all. The field is not optional in the S3

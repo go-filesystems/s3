@@ -41,8 +41,11 @@ type Server struct {
 	// the package doc.
 	ReadOnly bool
 
-	// MaxObjectBytes bounds what GET will read into memory, because the driver
-	// interface has no streaming read. 0 takes the default.
+	// MaxObjectBytes is the largest object whose ETag is the MD5 of its
+	// content (larger ones get a multipart-shaped ETag, which clients do not
+	// compare with one), and the largest a driver without Opener may serve,
+	// since such a driver can only hand over a whole file in memory. A driver
+	// with Opener is streamed whatever the size. 0 takes the default.
 	MaxObjectBytes int64
 
 	// ClockSkew is how far a signed request may be from this server's clock.
@@ -70,7 +73,7 @@ func New(fsys filesystem.Filesystem, creds CredentialLookup) (*Server, error) {
 		return nil, errNoCredentials
 	}
 	return &Server{
-		store:       store{fsys: fsys, maxObject: defaultMaxObject},
+		store:       store{fsys: fsys, etags: newETagCache()},
 		Credentials: creds,
 		ReadOnly:    true,
 	}, nil
@@ -83,6 +86,16 @@ func (s *Server) now() time.Time {
 	return time.Now()
 }
 
+// maxObject is MaxObjectBytes or its default. It is read where it is used:
+// ServeHTTP used to copy it into the store at every request, a write that
+// concurrent requests raced on.
+func (s *Server) maxObject() int64 {
+	if s.MaxObjectBytes > 0 {
+		return s.MaxObjectBytes
+	}
+	return defaultMaxObject
+}
+
 func (s *Server) skew() time.Duration {
 	if s.ClockSkew > 0 {
 		return s.ClockSkew
@@ -91,9 +104,6 @@ func (s *Server) skew() time.Duration {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.MaxObjectBytes > 0 {
-		s.store.maxObject = s.MaxObjectBytes
-	}
 	if _, e := s.authorize(r); e.code != "" {
 		writeError(w, r, e)
 		return
@@ -198,7 +208,7 @@ func (s *Server) objectOp(w http.ResponseWriter, r *http.Request, bkt, key strin
 	}
 	switch r.Method {
 	case http.MethodHead:
-		o, err := s.store.head(bkt, key)
+		o, err := s.store.head(bkt, key, s.maxObject())
 		if err != nil {
 			writeError(w, r, mapObjectErr(err))
 			return
@@ -215,34 +225,51 @@ func (s *Server) objectOp(w http.ResponseWriter, r *http.Request, bkt, key strin
 }
 
 func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bkt, key string) {
-	data, o, err := s.store.get(bkt, key)
+	body, done, o, err := s.store.get(bkt, key, s.maxObject())
 	if err != nil {
 		writeError(w, r, mapObjectErr(err))
 		return
 	}
+	defer done()
 	setObjectHeaders(w, o)
 
-	rangeHdr := r.Header.Get("Range")
-	if rangeHdr == "" {
-		w.Header().Set("Content-Length", strconv.FormatInt(o.size, 10))
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(data)
+	start, end := int64(0), o.size-1
+	status := http.StatusOK
+	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
+		var ok bool
+		start, end, ok = parseRange(rangeHdr, o.size)
+		if !ok {
+			// ⛔ 416 must carry Content-Range with the real size, or a client
+			// cannot tell "you asked past the end" from "the server is
+			// confused", and retries the same request.
+			w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(o.size, 10))
+			writeError(w, r, errInvalidRange)
+			return
+		}
+		w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(start, 10)+"-"+
+			strconv.FormatInt(end, 10)+"/"+strconv.FormatInt(o.size, 10))
+		status = http.StatusPartialContent
+	}
+	n := end - start + 1
+	w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
+	w.WriteHeader(status)
+	if r.Method == http.MethodHead || n <= 0 {
 		return
 	}
-	start, end, ok := parseRange(rangeHdr, o.size)
-	if !ok {
-		// ⛔ 416 must carry Content-Range with the real size, or a client
-		// cannot tell "you asked past the end" from "the server is confused",
-		// and retries the same request.
-		w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(o.size, 10))
-		writeError(w, r, errInvalidRange)
-		return
+	_, _ = io.Copy(w, s.sendable(body, start, n))
+}
+
+// sendable is the range to send. A file of the host goes as itself, seeked
+// and bounded: net/http hands it to the connection's ReadFrom, which on plain
+// TCP is sendfile(2) and copies nothing through this process. Anything else
+// is read a section at a time.
+func (s *Server) sendable(body io.ReaderAt, start, n int64) io.Reader {
+	if hf, ok := body.(filesystem.HostFile); ok {
+		if _, err := hf.Seek(start, io.SeekStart); err == nil {
+			return &io.LimitedReader{R: hf, N: n}
+		}
 	}
-	w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(start, 10)+"-"+
-		strconv.FormatInt(end, 10)+"/"+strconv.FormatInt(o.size, 10))
-	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-	w.WriteHeader(http.StatusPartialContent)
-	_, _ = w.Write(data[start : end+1])
+	return io.NewSectionReader(body, start, n)
 }
 
 func setObjectHeaders(w http.ResponseWriter, o object) {

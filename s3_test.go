@@ -3,6 +3,8 @@
 package s3
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/xml"
 	"io"
 	"net/http"
@@ -176,7 +178,7 @@ func TestGetObject_BodyAndETagMatchTheBytes(t *testing.T) {
 	if w.Body.String() != "alpha" {
 		t.Errorf("body = %q", w.Body.String())
 	}
-	if got, want := w.Header().Get("ETag"), etagOf([]byte("alpha")); got != want {
+	if got, want := w.Header().Get("ETag"), md5ETag("alpha"); got != want {
 		t.Errorf("ETag = %s, want %s (the MD5 clients verify against)", got, want)
 	}
 }
@@ -486,4 +488,11 @@ func TestAnErrorCarriesARequestID(t *testing.T) {
 	if !regexp.MustCompile(`^[0-9a-f]{16}$`).MatchString(e.RequestID) {
 		t.Errorf("RequestId = %q", e.RequestID)
 	}
+}
+
+// md5ETag is what an object's ETag must be: the quoted hex MD5 of its bytes,
+// computed here and not by the code under test.
+func md5ETag(s string) string {
+	sum := md5.Sum([]byte(s))
+	return `"` + hex.EncodeToString(sum[:]) + `"`
 }
