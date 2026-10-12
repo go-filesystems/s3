@@ -6,7 +6,7 @@ require (
 	github.com/go-filesystems/fat32 v0.5.0
 	github.com/go-filesystems/interface v0.5.0
 	github.com/go-filesystems/osfs v0.3.0
-	github.com/go-volumes/s3 v0.0.0-20261011024906-b5b9a26d83fb
+	github.com/go-volumes/s3 v0.0.0-20261012063907-c8acae20c27c
 )
 
 require (
