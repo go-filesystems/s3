@@ -1,12 +1,12 @@
 module github.com/go-filesystems/s3
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/go-filesystems/fat32 v0.5.0
 	github.com/go-filesystems/interface v0.5.0
 	github.com/go-filesystems/osfs v0.3.0
-	github.com/go-volumes/s3 v0.2.0
+	github.com/go-volumes/s3 v0.2.2
 )
 
 require (
