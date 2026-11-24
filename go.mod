@@ -28,7 +28,7 @@ module github.com/go-filesystems/s3
 go 1.27.4
 
 require (
-	github.com/go-filesystems/fat32 v0.13.0
+	github.com/go-filesystems/fat32 v0.13.1
 	github.com/go-filesystems/interface v0.6.0
 	github.com/go-filesystems/osfs v0.4.0
 	github.com/go-volumes/s3 v0.2.2
@@ -36,6 +36,6 @@ require (
 
 require (
 	github.com/go-volumes/gpt v0.3.0 // indirect
-	github.com/go-volumes/safeio v0.0.0-20261011024942-5635ea21db3b // indirect
+	github.com/go-volumes/safeio v0.1.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 )
